@@ -112,6 +112,7 @@ class FLVDemuxer {
             (new DataView(buf)).setInt16(0, 256, true);  // little-endian write
             return (new Int16Array(buf))[0] === 256;  // platform-spec read, if equal then LE
         })();
+        this._encounteredNalus = new Set();
     }
 
     destroy() {
@@ -936,6 +937,12 @@ class FLVDemuxer {
             let sps = new Uint8Array(arrayBuffer, dataOffset + offset, len);
             offset += len;
 
+            let spsStr = '';
+            for (let idx = 0; idx < Math.min(20, sps.length); idx++) {
+                spsStr += sps[idx].toString(16).padStart(2, '0') + ' ';
+            }
+            console.log(`[FLVDemuxer] AVCC SPS (len: ${len}) hex head: ${spsStr}`);
+
             let config = SPSParser.parseSPS(sps);
             if (i !== 0) {
                 // ignore other sps's config
@@ -1043,11 +1050,30 @@ class FLVDemuxer {
         let v = new DataView(arrayBuffer, dataOffset, dataSize);
 
         let units = [], length = 0;
+        let localSPS = null;
+        let localPPS = null;
 
         let offset = 0;
         const lengthSize = this._naluLengthSize;
         let dts = this._timestampBase + tagTimestamp;
         let keyframe = (frameType === 1);  // from FLV Frame Type constants
+
+        const enableNALUFilter = true;
+        const filterSEI = true;
+        
+        if (!this._loggedFilterActive) {
+            this._loggedFilterActive = true;
+            console.log('[FLVDemuxer] H.264 NALU Filter is active (hardcoded true).');
+        }
+
+        if (!this._tagDebugCount) {
+            this._tagDebugCount = 0;
+        }
+        const isDebugTag = this._tagDebugCount < 10;
+        if (isDebugTag) {
+            this._tagDebugCount++;
+            console.log(`[FLVDemuxer] Tag #${this._tagDebugCount} size: ${dataSize}`);
+        }
 
         while (offset < dataSize) {
             if (offset + 4 >= dataSize) {
@@ -1065,15 +1091,54 @@ class FLVDemuxer {
             }
 
             let unitType = v.getUint8(offset + lengthSize) & 0x1F;
+            let data = new Uint8Array(arrayBuffer, dataOffset + offset, lengthSize + naluSize);
 
-            if (unitType === 5) {  // IDR
-                keyframe = true;
+            if (unitType === 7) {
+                localSPS = data.subarray(lengthSize);
+            } else if (unitType === 8) {
+                localPPS = data.subarray(lengthSize);
             }
 
-            let data = new Uint8Array(arrayBuffer, dataOffset + offset, lengthSize + naluSize);
-            let unit = {type: unitType, data: data};
-            units.push(unit);
-            length += data.byteLength;
+            if (isDebugTag) {
+                let bytesStr = '';
+                for (let idx = 0; idx < Math.min(10, naluSize); idx++) {
+                    bytesStr += v.getUint8(offset + lengthSize + idx).toString(16).padStart(2, '0') + ' ';
+                }
+                console.log(`  NALU size: ${naluSize}, type: ${unitType}, hex payload head: ${bytesStr}`);
+            }
+
+            if (!this._encounteredNalus) {
+                this._encounteredNalus = new Set();
+            }
+            if (!this._encounteredNalus.has(unitType)) {
+                this._encounteredNalus.add(unitType);
+                console.log(`[FLVDemuxer] 首次遇到 NALU Type: ${unitType}`);
+            }
+
+            let discard = false;
+            if (enableNALUFilter) {
+                if (unitType === 9 || // AUD
+                    unitType === 12 || // Filler Data
+                    unitType === 7 || // SPS
+                    unitType === 8 || // PPS
+                    (unitType >= 24 && unitType <= 31) || // Unspecified / Private
+                    (filterSEI && unitType === 6)) { // SEI
+                    discard = true;
+                }
+            }
+
+            if (discard) {
+                console.warn(`[FLVDemuxer] 已過濾未知的 NALU: NALU type ${unitType}, size: ${naluSize}`);
+            } else {
+                if (unitType === 5) {  // IDR
+                    keyframe = true;
+                }
+
+                let data = new Uint8Array(arrayBuffer, dataOffset + offset, lengthSize + naluSize);
+                let unit = {type: unitType, data: data};
+                units.push(unit);
+                length += data.byteLength;
+            }
 
             offset += lengthSize + naluSize;
         }
@@ -1093,6 +1158,63 @@ class FLVDemuxer {
             }
             track.samples.push(avcSample);
             track.length += length;
+        }
+
+        if (localSPS && localPPS && !this._hasUpdatedSPS) {
+            this._hasUpdatedSPS = true;
+            console.log('[FLVDemuxer] Updating AVCC config with correct stream SPS & PPS...');
+            
+            let spsPayload = localSPS;
+            let ppsPayload = localPPS;
+            
+            let avccSize = 11 + spsPayload.length + ppsPayload.length;
+            let avcc = new Uint8Array(avccSize);
+            avcc[0] = 1; // configurationVersion
+            avcc[1] = spsPayload[1]; // profile
+            avcc[2] = spsPayload[2]; // profileCompatibility
+            avcc[3] = spsPayload[3]; // level
+            avcc[4] = 0xFC | (this._naluLengthSize - 1); // lengthSizeMinusOne
+            avcc[5] = 0xE1; // numOfSPS = 1
+            avcc[6] = (spsPayload.length >>> 8) & 0xFF;
+            avcc[7] = spsPayload.length & 0xFF;
+            avcc.set(spsPayload, 8);
+            
+            let ppsOffset = 8 + spsPayload.length;
+            avcc[ppsOffset] = 1; // numOfPPS = 1
+            avcc[ppsOffset + 1] = (ppsPayload.length >>> 8) & 0xFF;
+            avcc[ppsOffset + 2] = ppsPayload.length & 0xFF;
+            avcc.set(ppsPayload, ppsOffset + 3);
+
+            if (this._videoMetadata) {
+                this._videoMetadata.avcc = avcc;
+                
+                let config = SPSParser.parseSPS(spsPayload);
+                this._videoMetadata.codecWidth = config.codec_size.width;
+                this._videoMetadata.codecHeight = config.codec_size.height;
+                this._videoMetadata.presentWidth = config.present_size.width;
+                this._videoMetadata.presentHeight = config.present_size.height;
+                this._videoMetadata.profile = config.profile_string;
+                this._videoMetadata.level = config.level_string;
+                
+                let codecArray = spsPayload.subarray(1, 4);
+                let codecString = 'avc1.';
+                for (let j = 0; j < 3; j++) {
+                    let h = codecArray[j].toString(16);
+                    if (h.length < 2) h = '0' + h;
+                    codecString += h;
+                }
+                this._videoMetadata.codec = codecString;
+                
+                let mi = this._mediaInfo;
+                mi.width = config.codec_size.width;
+                mi.height = config.codec_size.height;
+                mi.profile = config.profile_string;
+                mi.level = config.level_string;
+                mi.videoCodec = codecString;
+                
+                this._onTrackMetadata('video', this._videoMetadata);
+                console.log('[FLVDemuxer] AVCC config updated. Codec:', codecString, 'Level:', config.level_string);
+            }
         }
     }
 

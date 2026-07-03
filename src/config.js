@@ -20,6 +20,8 @@ export const defaultConfig = {
     enableWorker: false,
     enableStashBuffer: true,
     stashInitialSize: undefined,
+    enableNALUFilter: true,
+    filterSEI: true,
 
     isLive: false,
 

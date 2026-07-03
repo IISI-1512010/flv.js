@@ -15,9 +15,9 @@
     "javascript"
   ],
   "scripts": {
-    "build": "webpack --mode=production --progress",
-    "build:debug": "webpack --mode=development --progress",
-    "dev": "webpack --mode=development --progress --watch",
+    "build": "cross-env NODE_OPTIONS=--openssl-legacy-provider webpack --mode=production --progress",
+    "build:debug": "cross-env NODE_OPTIONS=--openssl-legacy-provider webpack --mode=development --progress",
+    "dev": "cross-env NODE_OPTIONS=--openssl-legacy-provider webpack --mode=development --progress --watch",
     "dtslint": "dtslint types"
   },
   "dependencies": {
@@ -29,6 +29,7 @@
     "@typescript-eslint/eslint-plugin": "^4.28.3",
     "@typescript-eslint/parser": "^4.28.3",
     "browser-sync": "^2.27.4",
+    "cross-env": "^7.0.3",
     "eslint": "^7.30.0",
     "exports-loader": "^3.0.0",
     "source-map-loader": "^3.0.0",
